@@ -7,8 +7,11 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/utils.sh"
 
-# Telegram API base URL
-readonly TELEGRAM_API="https://api.telegram.org/bot"
+# Telegram API base URL (resolved at call time, after .env is loaded)
+# Set TELEGRAM_API_URL=http://127.0.0.1:8081 to use a self-hosted Local Bot API Server
+tg_api() {
+    echo "${TELEGRAM_API_URL:-https://api.telegram.org}/bot${TELEGRAM_BOT_TOKEN}"
+}
 
 # Maximum retries for API calls
 readonly MAX_RETRIES=3
@@ -24,7 +27,7 @@ send_message() {
         return 0
     fi
     
-    local url="${TELEGRAM_API}${TELEGRAM_BOT_TOKEN}/sendMessage"
+    local url="$(tg_api)/sendMessage"
     local retry=0
     local wait_time=1
     
@@ -77,16 +80,25 @@ send_file() {
     
     local file_size=$(stat -c%s "${file_path}" 2>/dev/null || stat -f%z "${file_path}" 2>/dev/null)
     local file_name=$(basename "${file_path}")
-    local max_size=$((50 * 1024 * 1024))  # 50MB limit for Telegram Bot API
+    # 50MB for api.telegram.org, up to 2000MB for a Local Bot API Server
+    local max_mb="${TELEGRAM_MAX_FILE_MB:-50}"
+    local max_size=$((max_mb * 1024 * 1024))
     
     if [[ ${file_size} -gt ${max_size} ]]; then
-        log_error "File too large for Telegram (${file_size} bytes > 50MB limit)"
+        log_error "File too large for Telegram (${file_size} bytes > ${max_mb}MB limit)"
         return 1
+    fi
+    
+    # In local mode the Bot API server reads the file straight from disk
+    # (no multipart upload, no temp copy). Requires the same path inside the server.
+    local document_field="@${file_path}"
+    if [[ "${TELEGRAM_LOCAL_MODE:-false}" == "true" ]]; then
+        document_field="file://$(realpath "${file_path}")"
     fi
     
     log_info "Uploading file: ${file_name} ($(format_bytes ${file_size}))"
     
-    local url="${TELEGRAM_API}${TELEGRAM_BOT_TOKEN}/sendDocument"
+    local url="$(tg_api)/sendDocument"
     local retry=0
     local wait_time=2
     
@@ -94,11 +106,11 @@ send_file() {
         local response
         response=$(curl -s -X POST "${url}" \
             -F "chat_id=${TELEGRAM_CHAT_ID}" \
-            -F "document=@${file_path}" \
+            -F "document=${document_field}" \
             -F "caption=${caption}" \
             -F "parse_mode=HTML" \
             --connect-timeout 60 \
-            --max-time 300)
+            --max-time "${TELEGRAM_UPLOAD_TIMEOUT:-1800}")
         
         # Check if request was successful
         if echo "${response}" | grep -q '"ok":true'; then
@@ -169,7 +181,7 @@ test_telegram_connection() {
         return 0
     fi
     
-    local url="${TELEGRAM_API}${TELEGRAM_BOT_TOKEN}/getMe"
+    local url="$(tg_api)/getMe"
     local response
     response=$(curl -s -X GET "${url}" --connect-timeout 10)
     
